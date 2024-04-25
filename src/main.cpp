@@ -1,9 +1,12 @@
 
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <ghc/filesystem.hpp>
 #include <span>
+#include <Geode/utils/cocos.hpp>
+#include <string_view>
 
 using namespace geode;
 using namespace cocos2d;
@@ -20,14 +23,9 @@ inline T& from_offset(void* self, uintptr_t offset) {
 	return *reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(self) + offset);
 }
 
-gd::unordered_map<int, int>& getRobtopsItemIdsMap()
+gd::unordered_map<int, int>& getRobtopsItemIdsMap(PlayLayer* pl = playlayer())
 {
-#if defined(GEODE_IS_WINDOWS)
-	auto self = GameManager::sharedState()->getPlayLayer()->m_effectManager;
-	return from_offset<gd::unordered_map<int, int>>(self, 512);
-#else
-	#error add some offset here
-#endif
+	return playlayer()->m_effectManager->m_itemIDs;
 }
 
 constexpr int INVALID_INT = -1;
@@ -39,6 +37,23 @@ bool isNumeric(std::string_view str)
 			return false;
 	return true;
 }
+
+std::optional<int> countForItem(int itemid, PlayLayer* pl = playlayer())
+{
+#if defined(GEODE_IS_WINDOWS)
+	auto& gdmap = getRobtopsItemIdsMap();
+	if(auto it = gdmap.find(itemid); it != gdmap.end()) return it->second;
+	return {};
+#else
+	return pl->m_effectManager->countForItem(itemid);
+#endif
+}
+
+void updateCountForItem(int id, int value, PlayLayer* pl = playlayer())
+{
+	pl->m_effectManager->updateCountForItem(id, value);
+}
+
 
 //@{key} {value}
 std::optional<std::string_view> getValueFromText(std::string_view line, std::string_view key)
@@ -57,12 +72,10 @@ std::optional<std::string_view> getValueFromText(std::string_view line, std::str
 
 std::optional<int> getNumericValueFromText(std::string_view line, std::string_view key)
 {
-	auto val = getValueFromText(line, key);
-	if(!val) return {};
-	return geode::utils::numFromString<int>(*val).ok();
+	return geode::utils::numFromString<int>(getValueFromText(line, key).value_or("")).ok();
 }
 
-std::optional<std::pair<int, std::string_view>> getValueFromTextNumericValue(std::string_view line)
+std::optional<std::pair<int, std::string_view>> getValueFromTextNumericKey(std::string_view line)
 {
     constexpr auto npos = std::string_view::npos;
     if(line[0] != '@') return {};
@@ -77,7 +90,7 @@ std::optional<std::pair<int, std::string_view>> getValueFromTextNumericValue(std
 
 	if(auto key_i = geode::utils::numFromString<int>(key); key_i.isOk())
 	{
-	    decltype(getValueFromTextNumericValue(line)) ret;
+	    decltype(getValueFromTextNumericKey(line)) ret;
 		ret.emplace(key_i.unwrap(), value);
 		return ret;
 	}
@@ -88,7 +101,15 @@ struct PersistentID
 {
 	std::string key;
 	int itemID = 0;
-	bool operator<(const PersistentID& b) const { return itemID < b.itemID; };
+	bool operator==(const PersistentID& b) const { return itemID == b.itemID && key == b.key; };
+
+
+	static std::optional<PersistentID> fromLevelText(std::string_view line)
+	{
+		auto pair_opt = getValueFromTextNumericKey(line);
+		if(!pair_opt) return {};
+		return PersistentID{.key = std::string(pair_opt->second), .itemID = pair_opt->first};
+	}
 };
 
 struct PersPickup
@@ -105,16 +126,20 @@ struct PersPickup
 
  		//key <-> item ID, NOT VALUE
 		//this is loaded from text objects when the level starts
-		std::set<PersistentID> persistentIds;
-		gd::unordered_map<int, int> temp_died;
+		std::vector<PersistentID> levelSpecifiedPersItemIds;
+		std::unordered_map<int, int> temp_died;
 
 	} m;
 
 	std::optional<int> persistentItemIdForKey(std::string_view key)
 	{
-		for(const auto& persid : m.persistentIds)
+		for(const auto& persid : m.levelSpecifiedPersItemIds)
+		{
 			if(persid.key == key)
+			{
 				return persid.itemID;
+			}
+		}
 		return {};
 	}
 
@@ -126,6 +151,29 @@ struct PersPickup
 		}();
 
 		return id >= 1 ? std::optional(id) : std::nullopt;
+	}
+
+	geode::Result<matjson::Object, std::string> getJsonFromAccID()
+	{
+		auto path = getFilePathAccID();
+		std::ifstream file(path);
+		geode::log::info("Try Read {}", path.string());
+
+		if(!file.good())
+		{
+			geode::log::error("Could not read {}", path.string());
+			return Err("Could not read file");
+		}
+		std::string str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+		log::info("str: {}", str);
+		std::string jsonError;
+		auto jsonopt = matjson::Value::from_str(str, jsonError);
+		if(!jsonopt) return geode::Err(jsonError.c_str());
+		
+
+		const matjson::Value& json = *jsonopt;
+		if(!json.is_object()) return Err("Wrong main json type");
+		return Ok(json.as_object());
 	}
 
 	void tryLoadLevel(PlayLayer* pl, GJGameLevel* level)
@@ -146,7 +194,8 @@ struct PersPickup
 		}
 		if(!m.mod_enabled) return log::error("text @perspickup not found");
 
-		m.accID = optAccId.value();
+		m.accID = *optAccId;
+		loadSpecialGroupIds(textObjects);
 		loadFromFile(textObjects);
 	}
 
@@ -162,7 +211,12 @@ struct PersPickup
 		m.saveGroup = INVALID_INT;
 		m.applyGroup = INVALID_INT;
 		m.enabledGroup = INVALID_INT;
-		m.persistentIds.clear();
+		m.levelSpecifiedPersItemIds.clear();
+		m.levelSpecifiedPersItemIds.shrink_to_fit();
+		m.temp_died.clear();
+		m.hasLoadedOnce = false;
+		m.mod_enabled = false;
+		log::info("Reseted, size of item ids {}", m.levelSpecifiedPersItemIds.size());
 	}
 
 	static PersPickup& get()
@@ -173,12 +227,21 @@ struct PersPickup
 
 	void loadSpecialGroupIds(std::span<std::string_view> textObjects)
 	{
-		for(const auto& str : textObjects)
+    	auto check_line = [&](const auto& line)
 		{
-			if(auto v = getNumericValueFromText(str, "save")) m.saveGroup = *v;
-			if(auto v = getNumericValueFromText(str, "apply")) m.applyGroup = *v;
-			if(auto v = getNumericValueFromText(str, "restore")) m.restoreGroup = *v;
-		}
+			if(auto v = getNumericValueFromText(line, "save"))
+			{
+				m.saveGroup = *v;
+			}
+			else if(auto v = getNumericValueFromText(line, "enable"))
+			{
+				m.enabledGroup = *v;
+				updateCountForItem(*v, 1);
+				if(auto p = playlayer()) p->updateCounters(*v, 1);
+			}
+    	};
+
+		std::for_each(textObjects.begin(), textObjects.end(), check_line);
 	}
 
 	static std::vector<std::string_view> getAllTexts(PlayLayer* pl)
@@ -201,106 +264,146 @@ struct PersPickup
 
 	void playerBeforeDying()
 	{
-		for(const auto& ids : getRobtopsItemIdsMap())
-			m.temp_died.insert_or_assign(ids.first, ids.second);
+		for(const auto& ids : m.levelSpecifiedPersItemIds)
+		{
+			auto currentId = countForItem(ids.itemID);
+			if(currentId) m.temp_died.insert_or_assign(ids.itemID, *currentId);
+		}
 	}
 
 	void playerDied()
 	{
+		geode::log::info("Player died, setting up ids");
 		auto pl = playlayer();
-		auto& map = getRobtopsItemIdsMap();
-		for(const auto& persid : m.persistentIds)
+		if(m.enabledGroup != INVALID_INT)
+		{
+			updateCountForItem(m.enabledGroup, 1, pl);
+			pl->updateCounters(m.enabledGroup, 1);
+		}
+
+		for(const auto& persid : m.levelSpecifiedPersItemIds)
 		{
 			auto savedID = m.temp_died.find(persid.itemID);
-			if(savedID == map.end()) continue;
+			if(savedID == m.temp_died.end()) continue;
 
 			int id = savedID->first;
 			int val = savedID->second;
 
-			map.insert_or_assign(id, val);
+			updateCountForItem(id, val, pl);
 			pl->updateCounters(id, val);
 		}
 		m.temp_died.clear();
 	}
 
-	void loadPersistentItemIds(std::span<std::string_view> textObjects)
+	[[nodiscard]] bool levelItemIDExists(const PersistentID& other)
 	{
+		return levelItemIDExists(other.key, other.itemID);
+	}
+
+	[[nodiscard]] bool levelItemIDExists(std::string_view key, int itemid)
+	{
+		for(const auto& checkDuplicate : m.levelSpecifiedPersItemIds)
+			if(checkDuplicate.itemID == itemid && checkDuplicate.key == key)
+				return true;
+		return false;
+	}
+
+	static std::vector<PersistentID> getPersistentLevelIds(std::span<std::string_view> textObjects)
+	{
+		std::vector<PersistentID> ret;
+		auto levelItemIDExists = [&](const PersistentID& id)
+		{
+			for(const auto& checkDuplicate : ret)
+				if(checkDuplicate.itemID == id.itemID && checkDuplicate.key == id.key)
+					return true;
+			return false;
+		};
+
+
 		for(const auto& str : textObjects)
 		{
-			if(auto pair = getValueFromTextNumericValue(str))
+			if(auto opt = PersistentID::fromLevelText(str); opt && !levelItemIDExists(*opt))
 			{
-				m.persistentIds.insert(PersistentID{.key = std::string(pair->second), .itemID = pair->first});
+				log::info("Emplacing {} {}", opt->key, opt->itemID);
+				ret.emplace_back(*opt);
+			}
+		}
+		return ret;
+	}
+
+	void loadFromFile(std::span<std::string_view> textObjects)
+	{
+		m.levelSpecifiedPersItemIds = getPersistentLevelIds(textObjects);
+
+		auto jsonopt = getJsonFromAccID();
+		if(!jsonopt) return geode::log::error("{}", jsonopt.unwrapErr());
+
+		const auto& jsonobj = jsonopt.unwrap();
+
+		auto valueForItemId_find = [&jsonobj](const PersistentID& id) -> std::optional<int> {
+			if(auto it = jsonobj.find(id.key); it != jsonobj.end())
+			{
+				return it->second.is_number() ? std::optional(it->second.as_int()) : std::nullopt;
+			}
+			return {};
+		};
+
+		auto pl = playlayer();
+
+		if(m.enabledGroup != INVALID_INT) updateCountForItem(m.enabledGroup, 1, pl);
+
+		for(const auto& item_in_level : m.levelSpecifiedPersItemIds)
+		{
+			log::info("by {}", item_in_level.key);
+			if(auto itemidvalue = valueForItemId_find(item_in_level))
+			{
+				int itemid = item_in_level.itemID;
+				int value = *itemidvalue;
+				updateCountForItem(itemid, value, pl);
+				pl->updateCounters(itemid, value);
 			}
 		}
 	}
 
-	bool loadFromFile(std::span<std::string_view> textObjects)
+	void saveToFile()
 	{
-		loadPersistentItemIds(textObjects);
+		auto jsonOpt = getJsonFromAccID();
+		if(!jsonOpt) log::error("Error parsing json {}", jsonOpt.unwrapErr());
 
-		auto path = getFilePathAccID();
-		std::ifstream file(path);
-		if(!file) return false;
 
-		std::string str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-		std::string jsonError;
-		auto jsonopt = matjson::Value::from_str(str, jsonError);
-		if(!jsonopt)
+		auto holder = jsonOpt.value_or(matjson::Object{});
+
+		for(int itemIDValue = INVALID_INT; const auto& persistentId : m.levelSpecifiedPersItemIds)
 		{
-			geode::log::error("Error parsing json: {}", jsonError);
-			return false;
-		}
+			if(auto it = countForItem(persistentId.itemID); !it) continue;
+			else itemIDValue = *it;
 
-		const matjson::Value& json = jsonopt.value();
-		if(!json.is_object()) return false;
+			//if duplicated, update the value and continue
+			if(auto it = holder.find(persistentId.key); it != holder.end())
+			{
+				it->second = itemIDValue;
+			}
+			else
+			{
+				holder.insert({persistentId.key, itemIDValue});
+			}
 
 
-		auto pl = playlayer();
-		auto& gdmap = getRobtopsItemIdsMap();
-
-        for(const auto& savedItem : json.as_object())
-		{
-			if(!savedItem.second.is_number()) continue;
-
-			auto itemid = persistentItemIdForKey(savedItem.first);
-			if(!itemid) continue;
-
-			gdmap.insert_or_assign(itemid.value(), savedItem.second.as_int());
-			pl->updateCounters(
-				itemid.value(), //item id specified in level text object
-				savedItem.second.as_int() //item value saved in json
-			);
-		}
-		return true;
-	}
-
-	bool saveToFile()
-	{
-		auto path = getFilePathAccID();
-		std::ofstream f(path);
-		if(!f.good()) return false;
-		matjson::Object holder;
-
-		for(const auto& persistentId : m.persistentIds)
-		{
-			auto gdmap = getRobtopsItemIdsMap();
-			auto it = gdmap.find(persistentId.itemID);
-			if(it == gdmap.end()) continue;
-
-			holder.insert({std::string(persistentId.key), it->second});
 		}
 		
 		if(holder.empty())
 		{
-			geode::log::error("Could not find any values to save, something wrong probably happened");
-			return false;
+			return geode::log::error("Could not find any values to save, something wrong probably happened");
 		}
 
+		auto path = getFilePathAccID();
+		std::ofstream f(path);
+		if(!f.good()) return;
+		
 		auto jsonstr = matjson::Value(holder).dump(4);
 		f << jsonstr;
 		geode::log::info("Saving: {}", jsonstr);
 		geode::log::info("At \"{}\"", path.string());
-		return true;
 	}
 };
 
@@ -314,6 +417,7 @@ struct MyPlayLayer : Modify<MyPlayLayer, PlayLayer>
 		PersPickup::get().tryLoadLevel(this, m_level);
 	}
 
+#if defined(GEODE_IS_WINDOWS)
 	void pauseGame(bool a)
 	{
 		PlayLayer::pauseGame(a);
@@ -322,6 +426,7 @@ struct MyPlayLayer : Modify<MyPlayLayer, PlayLayer>
 			geode::log::info("{} {}", o.first, o.second);
 		}
 	}
+#endif
 	void onQuit()
 	{
 		PlayLayer::onQuit();
@@ -342,6 +447,30 @@ struct MyPlayLayer : Modify<MyPlayLayer, PlayLayer>
 		else
 		{
 			PlayLayer::resetLevel();
+		}
+	}
+};
+
+struct PauseLayerHook : geode::Modify<PauseLayerHook, PauseLayer>
+{
+	void onEdit(CCObject* s)
+	{
+		if(auto p = PersPickup::get(); p.m.mod_enabled)
+		{
+			p.saveFileAndReset();
+		}
+		PauseLayer::onEdit(s);
+	} 
+};
+
+struct GB : geode::Modify<GB, GJBaseGameLayer>
+{
+	void spawnGroupTriggered(int groupid, float b, bool c, gd::vector<int> const& d, int e, int f)
+	{
+		GJBaseGameLayer::spawnGroupTriggered(groupid, b, c, d, e, f);
+		if(auto p = PersPickup::get(); playlayer() && p.m.mod_enabled && p.m.hasLoadedOnce && p.m.saveGroup == groupid)
+		{
+			p.saveToFile();
 		}
 	}
 };

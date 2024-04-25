@@ -1,9 +1,12 @@
 {
 	"geode": "2.0.0-beta.23",
-	"gd": "2.204",
-	"version": "v1.0.0",
+	"gd": {
+		"win": "2.204",
+		"android": "2.205"
+	},
+	"version": "v0.1.0",
 	"id": "iandyhd3.persistent_pickup_ids",
-	"name": "Persistent Pickup IDS",
+	"name": "Pickups Across Sessions",
 	"developer": "iAndyHD3",
 	"description": "save pickup ids across sessions"
 }
