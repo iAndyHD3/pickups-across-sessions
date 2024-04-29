@@ -25,7 +25,7 @@ inline T& from_offset(void* self, uintptr_t offset) {
 
 gd::unordered_map<int, int>& getRobtopsItemIdsMap(PlayLayer* pl = playlayer())
 {
-	return playlayer()->m_effectManager->m_itemIDs;
+	return from_offset<gd::unordered_map<int, int>>(pl->m_effectManager, 512);
 }
 
 constexpr int INVALID_INT = -1;
@@ -41,7 +41,8 @@ bool isNumeric(std::string_view str)
 std::optional<int> countForItem(int itemid, PlayLayer* pl = playlayer())
 {
 #if defined(GEODE_IS_WINDOWS)
-	auto& gdmap = getRobtopsItemIdsMap();
+	itemid = itemid > 9998 ? 9998 : std::max(itemid, 0);
+	auto& gdmap = from_offset<gd::unordered_map<int, int>>(pl->m_effectManager, 512);
 	if(auto it = gdmap.find(itemid); it != gdmap.end()) return it->second;
 	return {};
 #else
@@ -157,15 +158,12 @@ struct PersPickup
 	{
 		auto path = getFilePathAccID();
 		std::ifstream file(path);
-		geode::log::info("Try Read {}", path.string());
 
 		if(!file.good())
 		{
-			geode::log::error("Could not read {}", path.string());
 			return Err("Could not read file");
 		}
 		std::string str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-		log::info("str: {}", str);
 		std::string jsonError;
 		auto jsonopt = matjson::Value::from_str(str, jsonError);
 		if(!jsonopt) return geode::Err(jsonError.c_str());
@@ -216,7 +214,6 @@ struct PersPickup
 		m.temp_died.clear();
 		m.hasLoadedOnce = false;
 		m.mod_enabled = false;
-		log::info("Reseted, size of item ids {}", m.levelSpecifiedPersItemIds.size());
 	}
 
 	static PersPickup& get()
@@ -273,7 +270,6 @@ struct PersPickup
 
 	void playerDied()
 	{
-		geode::log::info("Player died, setting up ids");
 		auto pl = playlayer();
 		if(m.enabledGroup != INVALID_INT)
 		{
@@ -324,7 +320,6 @@ struct PersPickup
 		{
 			if(auto opt = PersistentID::fromLevelText(str); opt && !levelItemIDExists(*opt))
 			{
-				log::info("Emplacing {} {}", opt->key, opt->itemID);
 				ret.emplace_back(*opt);
 			}
 		}
@@ -354,7 +349,6 @@ struct PersPickup
 
 		for(const auto& item_in_level : m.levelSpecifiedPersItemIds)
 		{
-			log::info("by {}", item_in_level.key);
 			if(auto itemidvalue = valueForItemId_find(item_in_level))
 			{
 				int itemid = item_in_level.itemID;
@@ -369,7 +363,6 @@ struct PersPickup
 	{
 		auto jsonOpt = getJsonFromAccID();
 		if(!jsonOpt) log::error("Error parsing json {}", jsonOpt.unwrapErr());
-
 
 		auto holder = jsonOpt.value_or(matjson::Object{});
 
@@ -387,8 +380,6 @@ struct PersPickup
 			{
 				holder.insert({persistentId.key, itemIDValue});
 			}
-
-
 		}
 		
 		if(holder.empty())
@@ -402,8 +393,6 @@ struct PersPickup
 		
 		auto jsonstr = matjson::Value(holder).dump(4);
 		f << jsonstr;
-		geode::log::info("Saving: {}", jsonstr);
-		geode::log::info("At \"{}\"", path.string());
 	}
 };
 
@@ -413,20 +402,19 @@ struct MyPlayLayer : Modify<MyPlayLayer, PlayLayer>
 	void setupHasCompleted()
 	{
 		PlayLayer::setupHasCompleted();
-
 		PersPickup::get().tryLoadLevel(this, m_level);
 	}
 
-#if defined(GEODE_IS_WINDOWS)
-	void pauseGame(bool a)
-	{
-		PlayLayer::pauseGame(a);
-		for(const auto& o : from_offset<gd::unordered_map<int, int>>(m_effectManager, 512))
-		{
-			geode::log::info("{} {}", o.first, o.second);
-		}
-	}
-#endif
+// #if defined(GEODE_IS_WINDOWS)
+// 	void pauseGame(bool a)
+// 	{
+// 		PlayLayer::pauseGame(a);
+// 		for(const auto& o : from_offset<gd::unordered_map<int, int>>(m_effectManager, 512))
+// 		{
+// 			geode::log::info("{} {}", o.first, o.second);
+// 		}
+// 	}
+// #endif
 	void onQuit()
 	{
 		PlayLayer::onQuit();
@@ -451,17 +439,6 @@ struct MyPlayLayer : Modify<MyPlayLayer, PlayLayer>
 	}
 };
 
-struct PauseLayerHook : geode::Modify<PauseLayerHook, PauseLayer>
-{
-	void onEdit(CCObject* s)
-	{
-		if(auto p = PersPickup::get(); p.m.mod_enabled)
-		{
-			p.saveFileAndReset();
-		}
-		PauseLayer::onEdit(s);
-	} 
-};
 
 struct GB : geode::Modify<GB, GJBaseGameLayer>
 {
